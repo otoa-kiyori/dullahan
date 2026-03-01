@@ -190,6 +190,18 @@ void dullahan_impl::OnBeforeCommandLineProcessing(const CefString& process_type,
             }
             command_line->AppendSwitchWithValue("disable-features", disableFeatures);
 
+            // Prevent Chromium from exposing navigator.webdriver = true (reliable C++ fix).
+            // The JS shim also attempts to clear it but the C++ flag is the authoritative path
+            // because CEF's AutomationControlled blink feature controls the property at the
+            // binding level before any JS can observe it.
+            std::string disableBlinkFeatures = "AutomationControlled";
+            if (command_line->HasSwitch("disable-blink-features"))
+            {
+                disableBlinkFeatures = std::string(command_line->GetSwitchValue("disable-blink-features"))
+                                       + "," + disableBlinkFeatures;
+            }
+            command_line->AppendSwitchWithValue("disable-blink-features", disableBlinkFeatures);
+
             // Tell the render process app to activate its JS privacy shim.
             // CEF propagates custom switches from the browser process to all subprocesses.
             command_line->AppendSwitch("dullahan-protect-privacy");

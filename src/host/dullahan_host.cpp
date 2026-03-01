@@ -73,10 +73,60 @@ static const char kPrivacyShimJS[] = R"js(
     // passes its own locale setting through to CEF and must not be overridden.
     tryLock(Navigator.prototype, 'platform', 'Win32');
     tryLock(Navigator.prototype, 'pdfViewerEnabled', false);
-    // webdriver may be non-configurable in some CEF builds; delete first so
-    // tryLock can redefine it.  The outer try/catch makes this safe to attempt.
+    // webdriver: the C++ --disable-blink-features=AutomationControlled flag is the
+    // authoritative fix.  This JS attempt is belt-and-suspenders for any CEF variant
+    // where the flag has no effect.
     try { delete Navigator.prototype.webdriver; } catch (_) {}
     tryLock(Navigator.prototype, 'webdriver', false);
+
+    // --- Navigator: plugin / MIME enumeration ---
+    // The installed plugin list (navigator.plugins) and MIME type list
+    // (navigator.mimeTypes) reveal OS state and are used by FingerprintJS.
+    // Return empty array-like objects so no plugin information leaks.
+    (function () {
+        try {
+            const _emptyPlugins = {
+                length: 0,
+                item: function () { return null; },
+                namedItem: function () { return null; },
+                refresh: function () {},
+                [Symbol.iterator]: function* () {}
+            };
+            tryLock(Navigator.prototype, 'plugins', _emptyPlugins);
+        } catch (_) {}
+        try {
+            const _emptyMimes = {
+                length: 0,
+                item: function () { return null; },
+                namedItem: function () { return null; },
+                [Symbol.iterator]: function* () {}
+            };
+            tryLock(Navigator.prototype, 'mimeTypes', _emptyMimes);
+        } catch (_) {}
+    })();
+
+    // --- Navigator: network connection info ---
+    // navigator.connection (NetworkInformation API) exposes downlink, effectiveType,
+    // rtt, etc. that fingerprint network conditions.  Suppress it entirely.
+    try {
+        if (typeof Navigator !== 'undefined' && 'connection' in Navigator.prototype) {
+            Object.defineProperty(Navigator.prototype, 'connection', {
+                get: function () { return undefined; },
+                configurable: false,
+                enumerable: true
+            });
+        }
+    } catch (_) {}
+
+    // --- Screen: color depth ---
+    // screen.colorDepth and screen.pixelDepth expose display hardware capabilities.
+    // Lock to 24 (the universally common value on modern displays).
+    try {
+        if (typeof Screen !== 'undefined') {
+            tryLock(Screen.prototype, 'colorDepth', 24);
+            tryLock(Screen.prototype, 'pixelDepth', 24);
+        }
+    } catch (_) {}
 
     // --- Battery Status API ---
     // getBattery() is a fingerprint source; reject with a generic error so the
@@ -112,7 +162,7 @@ static const char kPrivacyShimJS[] = R"js(
             const _copyFromChannel = AudioBuffer.prototype.copyFromChannel;
             AudioBuffer.prototype.copyFromChannel = function (dest, ch, offset) {
                 _copyFromChannel.call(this, dest, ch, offset);
-                dest.fill(0);
+                if (dest && dest.fill) { dest.fill(0); }
             };
         } catch (_) {}
     }
@@ -289,7 +339,8 @@ static const char kPrivacyShimJS[] = R"js(
             try {
                 const _resolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
                 Intl.DateTimeFormat.prototype.resolvedOptions = function () {
-                    const opts = _resolvedOptions.call(this);
+                    // Clone before mutating — the native return may be a frozen object.
+                    const opts = Object.assign({}, _resolvedOptions.call(this));
                     if (opts.timeZone === _realZone) {
                         opts.timeZone = _fakeZone;
                     }
@@ -387,10 +438,13 @@ static const char kPrivacyShimJS[] = R"js(
             };
         } catch (_) {}
 
-        // 5. document.fonts.check() — direct FontFaceSet enumeration
-        // Returns false for every font so the API reveals nothing about the installed set.
+        // 5. FontFaceSet.prototype.check() — direct font presence probe.
+        // Patching the prototype covers all documents and iframes, not just the
+        // current document.fonts instance (which the instance-level patch would miss).
         try {
-            if (typeof document !== 'undefined' && document.fonts) {
+            if (typeof FontFaceSet !== 'undefined') {
+                FontFaceSet.prototype.check = function () { return false; };
+            } else if (typeof document !== 'undefined' && document.fonts) {
                 document.fonts.check = function () { return false; };
             }
         } catch (_) {}
@@ -400,12 +454,22 @@ static const char kPrivacyShimJS[] = R"js(
     // Even with WEBGL_debug_renderer_info disabled, gl.getParameter(RENDERER/VENDOR)
     // still returns the real GPU string.  getSupportedExtensions() returns a
     // GPU/driver-specific list.  Both are stabilized to generic WebKit values.
+    //
+    // Also intercepted:
+    //   - UNMASKED_RENDERER_WEBGL (0x9246) and UNMASKED_VENDOR_WEBGL (0x9245)
+    //     from the WEBGL_debug_renderer_info extension — these are the primary
+    //     GPU identification constants used by fingerprinters.
+    //   - getExtension('WEBGL_debug_renderer_info') — returns null so the extension
+    //     object itself is never handed to page code.
     (function () {
-        const _RENDERER = 0x1F01;
-        const _VENDOR   = 0x1F00;
+        const _RENDERER          = 0x1F01;
+        const _VENDOR            = 0x1F00;
+        const _UNMASKED_RENDERER = 0x9246;
+        const _UNMASKED_VENDOR   = 0x9245;
 
         // A fixed extension list modelled on a generic WebKit WebGL implementation.
         // Stable across all sessions so it does not contribute to a fingerprint.
+        // WEBGL_debug_renderer_info is intentionally absent.
         const _EXTS = [
             'ANGLE_instanced_arrays', 'EXT_blend_minmax',
             'EXT_color_buffer_half_float', 'EXT_frag_depth',
@@ -423,13 +487,20 @@ static const char kPrivacyShimJS[] = R"js(
             try {
                 const _gp = proto.getParameter;
                 proto.getParameter = function (p) {
-                    if (p === _RENDERER) { return 'WebKit WebGL'; }
-                    if (p === _VENDOR)   { return 'WebKit'; }
+                    if (p === _RENDERER || p === _UNMASKED_RENDERER) { return 'WebKit WebGL'; }
+                    if (p === _VENDOR   || p === _UNMASKED_VENDOR)   { return 'WebKit'; }
                     return _gp.call(this, p);
                 };
             } catch (_) {}
             try {
                 proto.getSupportedExtensions = function () { return _EXTS.slice(); };
+            } catch (_) {}
+            try {
+                const _getExt = proto.getExtension;
+                proto.getExtension = function (name) {
+                    if (name === 'WEBGL_debug_renderer_info') { return null; }
+                    return _getExt.call(this, name);
+                };
             } catch (_) {}
         }
 
@@ -441,23 +512,63 @@ static const char kPrivacyShimJS[] = R"js(
         }
     })();
 
-    // --- RTCPeerConnection — WebRTC local IP leak ---
-    // FingerprintJS Pro creates a peer connection with a STUN server and harvests
-    // ICE candidates to discover the real local (LAN) IP address, bypassing proxies.
-    // Stripping iceServers from every constructor call prevents STUN exchange and
-    // IP gathering while leaving WebRTC itself functional for legitimate use.
+    // --- RTCPeerConnection — WebRTC fingerprinting ---
+    // Three vectors are covered:
+    //   1. Local IP leak via STUN: strip iceServers so no ICE candidates are gathered.
+    //   2. onicecandidate: suppress the event so mDNS hostname UUIDs are not exposed.
+    //      (mDNS candidate UUIDs are stable per Chromium profile and act as device IDs.)
+    //   3. RTCRtpSender/Receiver.getCapabilities(): static methods that return the full
+    //      codec list without requiring a PeerConnection — replaced with a fixed generic
+    //      list so the Chromium build version cannot be inferred from codec parameters.
     (function () {
         if (typeof RTCPeerConnection === 'undefined') { return; }
         try {
             const _RPC = RTCPeerConnection;
             function _SafeRTCPeerConnection(config) {
                 const safe = config ? Object.assign({}, config, { iceServers: [] }) : {};
-                return new _RPC(safe);
+                const pc = new _RPC(safe);
+                // Suppress ICE candidate events — prevents mDNS UUID device fingerprint.
+                pc.addEventListener('icecandidate', function (e) {
+                    e.stopImmediatePropagation();
+                }, true);
+                return pc;
             }
             _SafeRTCPeerConnection.prototype = _RPC.prototype;
             Object.defineProperty(window, 'RTCPeerConnection', {
                 value: _SafeRTCPeerConnection, writable: true, configurable: true
             });
+        } catch (_) {}
+
+        // Fixed generic codec capability lists.  Real Chrome returns a build-specific
+        // list with precise profile-level-id and packetization-mode parameters.
+        const _audioCaps = { codecs: [
+            { mimeType: 'audio/opus',  clockRate: 48000, channels: 2 },
+            { mimeType: 'audio/G722',  clockRate: 8000,  channels: 1 },
+            { mimeType: 'audio/PCMU',  clockRate: 8000,  channels: 1 },
+            { mimeType: 'audio/PCMA',  clockRate: 8000,  channels: 1 }
+        ], headerExtensions: [] };
+        const _videoCaps = { codecs: [
+            { mimeType: 'video/VP8', clockRate: 90000 },
+            { mimeType: 'video/VP9', clockRate: 90000 }
+        ], headerExtensions: [] };
+
+        try {
+            if (typeof RTCRtpSender !== 'undefined') {
+                RTCRtpSender.getCapabilities = function (kind) {
+                    if (kind === 'audio') { return _audioCaps; }
+                    if (kind === 'video') { return _videoCaps; }
+                    return null;
+                };
+            }
+        } catch (_) {}
+        try {
+            if (typeof RTCRtpReceiver !== 'undefined') {
+                RTCRtpReceiver.getCapabilities = function (kind) {
+                    if (kind === 'audio') { return _audioCaps; }
+                    if (kind === 'video') { return _videoCaps; }
+                    return null;
+                };
+            }
         } catch (_) {}
     })();
 
@@ -501,22 +612,26 @@ static const char kPrivacyShimJS[] = R"js(
         try {
             const _mm = window.matchMedia.bind(window);
             // feature → the value that represents a neutral/common result.
-            // Queries containing the feature name get matches:true only when they
-            // also contain the neutral value string.
+            // Entries are ordered most-specific first so that 'any-pointer' is
+            // matched before 'pointer' and 'any-hover' before 'hover', preventing
+            // the shorter name from incorrectly matching inside the longer one.
             const _neutral = {
+                'any-pointer':            'fine',
+                'any-hover':              'hover',
+                'pointer':                'fine',
+                'hover':                  'hover',
                 'prefers-color-scheme':   'light',
                 'prefers-reduced-motion': 'no-preference',
                 'prefers-contrast':       'no-preference',
                 'forced-colors':          'none',
-                'color-gamut':            'srgb',
-                'pointer':                'fine',
-                'any-pointer':            'fine',
-                'hover':                  'hover',
-                'any-hover':              'hover'
+                'color-gamut':            'srgb'
             };
             window.matchMedia = function (query) {
                 for (const feature in _neutral) {
-                    if (query.indexOf(feature) >= 0) {
+                    // Match whole feature name followed by ':' or whitespace to avoid
+                    // false positives from one name being a substring of another.
+                    const _re = new RegExp('(?:^|[\\s(])' + feature + '[\\s:]');
+                    if (_re.test(query)) {
                         const matches = query.indexOf(_neutral[feature]) >= 0;
                         return {
                             matches:             matches,
@@ -539,14 +654,21 @@ static const char kPrivacyShimJS[] = R"js(
     // Chromium exposes a window.chrome object whose exact shape identifies the
     // CEF/Chrome version.  Replace it with a minimal stub that satisfies existence
     // checks without leaking version information.
+    //
+    // Check the existing property descriptor first: if it is already non-configurable
+    // (e.g. set by Chromium's own binding code before our extension runs), we cannot
+    // redefine it and must leave it in place rather than throwing a silent no-op.
     try {
         if (typeof window !== 'undefined') {
-            Object.defineProperty(window, 'chrome', {
-                value:        { runtime: {} },
-                writable:     false,
-                configurable: false,
-                enumerable:   true
-            });
+            const _chromeDesc = Object.getOwnPropertyDescriptor(window, 'chrome');
+            if (!_chromeDesc || _chromeDesc.configurable) {
+                Object.defineProperty(window, 'chrome', {
+                    value:        { runtime: {} },
+                    writable:     false,
+                    configurable: false,
+                    enumerable:   true
+                });
+            }
         }
     } catch (_) {}
 })();
@@ -567,7 +689,7 @@ public:
     // Called once in the render process after WebKit has been initialised but
     // before any frame contexts are created.  This is the correct place to
     // register V8 extensions: the extension code is then injected into every
-    // subsequent V8 context before any page script runs.
+    // subsequent frame/iframe V8 context before any page script runs.
     void OnWebKitInitialized() override
     {
         CefRefPtr<CefCommandLine> cmdLine = CefCommandLine::GetGlobalCommandLine();
@@ -578,6 +700,35 @@ public:
 
         // nullptr handler is fine for pure-JS extensions (no 'native function' declarations).
         CefRegisterExtension("dullahan/privacy", kPrivacyShimJS, nullptr);
+    }
+
+    // CefRenderProcessHandler override.
+    // Called for every new V8 context, including Web Worker contexts.
+    // CefRegisterExtension covers main frames and iframes automatically, but does
+    // NOT reach Web Worker V8 isolates.  Workers can bypass all JS shims by
+    // running unpatched APIs inside a worker blob — this callback closes that gap
+    // by evaluating the shim directly when the context has no associated frame
+    // (which indicates a Worker rather than a normal document context).
+    void OnContextCreated(CefRefPtr<CefBrowser> browser,
+                          CefRefPtr<CefFrame> frame,
+                          CefRefPtr<CefV8Context> context) override
+    {
+        if (frame)
+        {
+            // Normal frame/iframe — already covered by CefRegisterExtension.
+            return;
+        }
+
+        CefRefPtr<CefCommandLine> cmdLine = CefCommandLine::GetGlobalCommandLine();
+        if (!cmdLine->HasSwitch("dullahan-protect-privacy"))
+        {
+            return;
+        }
+
+        // Inject the privacy shim into the worker's V8 context.
+        CefRefPtr<CefV8Value>     retval;
+        CefRefPtr<CefV8Exception> exception;
+        context->Eval(kPrivacyShimJS, CefString(), 0, retval, exception);
     }
 
     IMPLEMENT_REFCOUNTING(dullahan_privacy_app);
