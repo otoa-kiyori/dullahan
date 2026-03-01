@@ -66,6 +66,18 @@ static const char kPrivacyShimJS[] = R"js(
     tryLock(Navigator.prototype, 'deviceMemory', 1);
     tryLock(Navigator.prototype, 'maxTouchPoints', 0);
 
+    // --- Navigator: identity / automation fingerprints ---
+    // platform reveals OS architecture; webdriver flags the browser as automated
+    // (may be true in CEF builds); pdfViewerEnabled reveals plugin presence.
+    // navigator.language/languages are intentionally left as-is — the SL viewer
+    // passes its own locale setting through to CEF and must not be overridden.
+    tryLock(Navigator.prototype, 'platform', 'Win32');
+    tryLock(Navigator.prototype, 'pdfViewerEnabled', false);
+    // webdriver may be non-configurable in some CEF builds; delete first so
+    // tryLock can redefine it.  The outer try/catch makes this safe to attempt.
+    try { delete Navigator.prototype.webdriver; } catch (_) {}
+    tryLock(Navigator.prototype, 'webdriver', false);
+
     // --- Battery Status API ---
     // getBattery() is a fingerprint source; reject with a generic error so the
     // API appears absent without throwing a synchronous exception.
@@ -313,11 +325,13 @@ static const char kPrivacyShimJS[] = R"js(
     //   4. CanvasRenderingContext2D.prototype.measureText — canvas text metrics
     //   5. document.fonts.check()                   — direct FontFaceSet probe
     (function () {
-        const _noise = function () { return (Math.random() * 0.000002) - 0.000001; };
+        // One seed per V8 context (= per page load), reused for every call so that
+        // measuring the same element twice gives the same result within a session.
+        const _sessionNoise = (Math.random() * 0.000002) - 0.000001;
 
         function _noisedRect(r) {
-            const n = _noise();
-            return new DOMRect(r.x + n, r.y + n, r.width + n, r.height + n);
+            return new DOMRect(r.x + _sessionNoise, r.y + _sessionNoise,
+                               r.width + _sessionNoise, r.height + _sessionNoise);
         }
 
         // 1. Element.getBoundingClientRect
@@ -353,7 +367,7 @@ static const char kPrivacyShimJS[] = R"js(
         // Undefined properties (older Chromium) are passed through as-is via _addNoise.
         try {
             const _measureText = CanvasRenderingContext2D.prototype.measureText;
-            const _addNoise = function (v) { return typeof v === 'number' ? v + _noise() : v; };
+            const _addNoise = function (v) { return typeof v === 'number' ? v + _sessionNoise : v; };
             CanvasRenderingContext2D.prototype.measureText = function (text) {
                 const m = _measureText.call(this, text);
                 return {
@@ -381,6 +395,160 @@ static const char kPrivacyShimJS[] = R"js(
             }
         } catch (_) {}
     })();
+
+    // --- WebGL fingerprinting ---
+    // Even with WEBGL_debug_renderer_info disabled, gl.getParameter(RENDERER/VENDOR)
+    // still returns the real GPU string.  getSupportedExtensions() returns a
+    // GPU/driver-specific list.  Both are stabilized to generic WebKit values.
+    (function () {
+        const _RENDERER = 0x1F01;
+        const _VENDOR   = 0x1F00;
+
+        // A fixed extension list modelled on a generic WebKit WebGL implementation.
+        // Stable across all sessions so it does not contribute to a fingerprint.
+        const _EXTS = [
+            'ANGLE_instanced_arrays', 'EXT_blend_minmax',
+            'EXT_color_buffer_half_float', 'EXT_frag_depth',
+            'EXT_sRGB', 'EXT_shader_texture_lod',
+            'EXT_texture_filter_anisotropic',
+            'OES_element_index_uint', 'OES_standard_derivatives',
+            'OES_texture_float', 'OES_texture_float_linear',
+            'OES_texture_half_float', 'OES_texture_half_float_linear',
+            'OES_vertex_array_object',
+            'WEBGL_color_buffer_float', 'WEBGL_depth_texture',
+            'WEBGL_draw_buffers', 'WEBGL_lose_context'
+        ];
+
+        function _patchWebGL(proto) {
+            try {
+                const _gp = proto.getParameter;
+                proto.getParameter = function (p) {
+                    if (p === _RENDERER) { return 'WebKit WebGL'; }
+                    if (p === _VENDOR)   { return 'WebKit'; }
+                    return _gp.call(this, p);
+                };
+            } catch (_) {}
+            try {
+                proto.getSupportedExtensions = function () { return _EXTS.slice(); };
+            } catch (_) {}
+        }
+
+        if (typeof WebGLRenderingContext  !== 'undefined') {
+            _patchWebGL(WebGLRenderingContext.prototype);
+        }
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            _patchWebGL(WebGL2RenderingContext.prototype);
+        }
+    })();
+
+    // --- RTCPeerConnection — WebRTC local IP leak ---
+    // FingerprintJS Pro creates a peer connection with a STUN server and harvests
+    // ICE candidates to discover the real local (LAN) IP address, bypassing proxies.
+    // Stripping iceServers from every constructor call prevents STUN exchange and
+    // IP gathering while leaving WebRTC itself functional for legitimate use.
+    (function () {
+        if (typeof RTCPeerConnection === 'undefined') { return; }
+        try {
+            const _RPC = RTCPeerConnection;
+            function _SafeRTCPeerConnection(config) {
+                const safe = config ? Object.assign({}, config, { iceServers: [] }) : {};
+                return new _RPC(safe);
+            }
+            _SafeRTCPeerConnection.prototype = _RPC.prototype;
+            Object.defineProperty(window, 'RTCPeerConnection', {
+                value: _SafeRTCPeerConnection, writable: true, configurable: true
+            });
+        } catch (_) {}
+    })();
+
+    // --- Math fingerprinting ---
+    // Platform-specific floating-point results from trig/hyperbolic functions are
+    // collected and hashed by some fingerprinters.  A per-session noise value is
+    // added to each non-zero result — too small to affect any computation but
+    // enough to make the fingerprint hash differ across sessions.
+    (function () {
+        const _mathNoise = (Math.random() - 0.5) * 1e-15;
+        ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
+         'sinh', 'cosh', 'tanh', 'exp', 'log'].forEach(function (fn) {
+            try {
+                const _orig = Math[fn];
+                Math[fn] = function () {
+                    const r = _orig.apply(Math, arguments);
+                    return r === 0 ? r : r + _mathNoise;
+                };
+            } catch (_) {}
+        });
+    })();
+
+    // --- Speech synthesis voices ---
+    // getVoices() returns an OS-specific list of TTS voices — highly identifying.
+    // Return an empty list so no voice information is exposed.
+    try {
+        if (typeof SpeechSynthesis !== 'undefined') {
+            SpeechSynthesis.prototype.getVoices = function () { return []; };
+        }
+    } catch (_) {}
+
+    // --- CSS media query fingerprinting ---
+    // FingerprintJS checks prefers-color-scheme, color-gamut, pointer type, etc.
+    // to fingerprint OS appearance settings and hardware capabilities.
+    // Known fingerprinting queries are intercepted and returned with neutral values;
+    // all other queries are passed through to the real matchMedia unmodified so
+    // that legitimate responsive-design code continues to work.
+    (function () {
+        if (typeof window === 'undefined' ||
+            typeof window.matchMedia !== 'function') { return; }
+        try {
+            const _mm = window.matchMedia.bind(window);
+            // feature → the value that represents a neutral/common result.
+            // Queries containing the feature name get matches:true only when they
+            // also contain the neutral value string.
+            const _neutral = {
+                'prefers-color-scheme':   'light',
+                'prefers-reduced-motion': 'no-preference',
+                'prefers-contrast':       'no-preference',
+                'forced-colors':          'none',
+                'color-gamut':            'srgb',
+                'pointer':                'fine',
+                'any-pointer':            'fine',
+                'hover':                  'hover',
+                'any-hover':              'hover'
+            };
+            window.matchMedia = function (query) {
+                for (const feature in _neutral) {
+                    if (query.indexOf(feature) >= 0) {
+                        const matches = query.indexOf(_neutral[feature]) >= 0;
+                        return {
+                            matches:             matches,
+                            media:               query,
+                            onchange:            null,
+                            addEventListener:    function () {},
+                            removeEventListener: function () {},
+                            addListener:         function () {},
+                            removeListener:      function () {},
+                            dispatchEvent:       function () { return false; }
+                        };
+                    }
+                }
+                return _mm(query);
+            };
+        } catch (_) {}
+    })();
+
+    // --- window.chrome ---
+    // Chromium exposes a window.chrome object whose exact shape identifies the
+    // CEF/Chrome version.  Replace it with a minimal stub that satisfies existence
+    // checks without leaking version information.
+    try {
+        if (typeof window !== 'undefined') {
+            Object.defineProperty(window, 'chrome', {
+                value:        { runtime: {} },
+                writable:     false,
+                configurable: false,
+                enumerable:   true
+            });
+        }
+    } catch (_) {}
 })();
 )js";
 
