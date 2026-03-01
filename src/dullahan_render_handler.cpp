@@ -197,6 +197,19 @@ bool dullahan_render_handler::GetScreenInfo(CefRefPtr<CefBrowser> browser, CefSc
     // this is how the value for "color depth" in the User Agent string is populated
     screen_info.depth = mBufferDepth * 8;
 
-    // indicate we changed the structure
+    if (mParent->getProtectPrivacy())
+    {
+        // Clamp reported screen size to the viewport (prim face dimensions).
+        // Without this, CEF falls back to the real monitor resolution for
+        // screen.width / screen.height in JavaScript, leaking a fingerprint.
+        int w, h;
+        mParent->getSize(w, h);
+        screen_info.rect           = CefRect(0, 0, w, h);
+        screen_info.available_rect = CefRect(0, 0, w, h);
+
+        // Normalise DPI so window.devicePixelRatio == 1 (not the real display scale)
+        screen_info.device_scale_factor = 1.0f;
+    }
+
     return true;
 }

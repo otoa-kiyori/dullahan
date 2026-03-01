@@ -77,6 +77,7 @@ dullahan_impl::dullahan_impl() :
     mFakeUIForMediaStream(false),
     mFlipPixelsY(false),
     mFlipMouseY(false),
+    mProtectPrivacy(false),
     mRequestContext(nullptr),
     mRequestedPageZoom(1.0)
 {
@@ -167,6 +168,32 @@ void dullahan_impl::OnBeforeCommandLineProcessing(const CefString& process_type,
         // it using native Viewer UI as before.
         // Details captured in this GHI: https://github.com/secondlife/viewer-private/issues/489
         command_line->AppendSwitch("disable-chrome-login-prompt");
+
+        if (mProtectPrivacy)
+        {
+            // Canvas readback protection is handled in the JS privacy shim via Brave-style
+            // noise injection (see dullahan_host.cpp kPrivacyShimJS).  The blunt
+            // --disable-reading-from-canvas switch is intentionally NOT used here because
+            // it breaks legitimate canvas use (image export, QR scanners, etc.).
+
+            // Block WebGL GPU identification - removes UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL
+            // Hardware WebGL rendering is preserved; only the debug info extension is hidden.
+            command_line->AppendSwitchWithValue("disable-webgl-extensions", "WEBGL_debug_renderer_info");
+
+            // Disable User-Agent Client Hints (Sec-CH-UA-* request headers)
+            // Must merge with any existing --disable-features value (e.g. NetworkService set above)
+            std::string disableFeatures = "UserAgentClientHint";
+            if (command_line->HasSwitch("disable-features"))
+            {
+                disableFeatures = std::string(command_line->GetSwitchValue("disable-features"))
+                                  + "," + disableFeatures;
+            }
+            command_line->AppendSwitchWithValue("disable-features", disableFeatures);
+
+            // Tell the render process app to activate its JS privacy shim.
+            // CEF propagates custom switches from the browser process to all subprocesses.
+            command_line->AppendSwitch("dullahan-protect-privacy");
+        }
 
         platformAddCommandLines(command_line);
     }
@@ -400,6 +427,10 @@ bool dullahan_impl::initCEF(dullahan::dullahan_settings& user_settings)
     // if true, this setting inverts the injected mouse coordinates in Y direction
     // useful for matching the setting for flipPixelsY
     mFlipMouseY = user_settings.flip_mouse_y;
+
+    // if true, blocks canvas readback, WebGL GPU identification, UA Client Hints,
+    // and screen resolution/DPI leaks to reduce browser fingerprinting
+    mProtectPrivacy = user_settings.protect_privacy;
 
     // log file settings
     CefString(&settings.log_file) = user_settings.log_file;

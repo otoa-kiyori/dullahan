@@ -27,6 +27,397 @@
 #define NOMINMAX
 
 #include "cef_app.h"
+#include "cef_render_process_handler.h"
+
+///////////////////////////////////////////////////////////////////////////////
+// dullahan_privacy_app
+//
+// Render-process CefApp that installs a JS shim when the browser process has
+// set the --dullahan-protect-privacy command-line switch.  The shim locks
+// navigator properties and neutralises AudioContext/OfflineAudioContext
+// fingerprinting before any page script can read those values.
+//
+// It is wired in as the |application| argument to CefExecuteProcess() on every
+// platform so that the render sub-process has access to CefRenderProcessHandler
+// callbacks.
+///////////////////////////////////////////////////////////////////////////////
+
+// JavaScript code registered as a V8 extension via CefRegisterExtension().
+// Runs synchronously in every frame's V8 context before any page script.
+static const char kPrivacyShimJS[] = R"js(
+(function () {
+    // Lock a property with a non-configurable, non-writable descriptor.
+    // A try/catch guards against properties that are already non-configurable
+    // with a different value (shouldn't happen, but safe to skip).
+    function tryLock(obj, prop, value) {
+        try {
+            Object.defineProperty(obj, prop, {
+                value: value,
+                writable: false,
+                configurable: false,
+                enumerable: true
+            });
+        } catch (_) {}
+    }
+
+    // --- Navigator: hardware / device fingerprints ---
+    // Return plausible but generic values that don't identify the host machine.
+    tryLock(Navigator.prototype, 'hardwareConcurrency', 2);
+    tryLock(Navigator.prototype, 'deviceMemory', 1);
+    tryLock(Navigator.prototype, 'maxTouchPoints', 0);
+
+    // --- Battery Status API ---
+    // getBattery() is a fingerprint source; reject with a generic error so the
+    // API appears absent without throwing a synchronous exception.
+    if (typeof Navigator.prototype.getBattery === 'function') {
+        Navigator.prototype.getBattery = function () {
+            return Promise.reject(new Error('Not supported'));
+        };
+    }
+
+    // --- AudioContext fingerprinting ---
+    // FingerprintJS creates an OfflineAudioContext, runs an oscillator through
+    // a DynamicsCompressor, and hashes the resulting Float32 sample data.
+    // Intercept startRendering() and zero every channel of the rendered buffer
+    // before the promise resolves so the caller always gets silence.
+    if (typeof OfflineAudioContext !== 'undefined') {
+        try {
+            const _startRendering = OfflineAudioContext.prototype.startRendering;
+            OfflineAudioContext.prototype.startRendering = function () {
+                return _startRendering.call(this).then(function (buf) {
+                    for (let c = 0; c < buf.numberOfChannels; c++) {
+                        buf.getChannelData(c).fill(0);
+                    }
+                    return buf;
+                });
+            };
+        } catch (_) {}
+    }
+
+    // Also cover the synchronous copyFromChannel path used by some fingerprinters.
+    if (typeof AudioBuffer !== 'undefined' && AudioBuffer.prototype.copyFromChannel) {
+        try {
+            const _copyFromChannel = AudioBuffer.prototype.copyFromChannel;
+            AudioBuffer.prototype.copyFromChannel = function (dest, ch, offset) {
+                _copyFromChannel.call(this, dest, ch, offset);
+                dest.fill(0);
+            };
+        } catch (_) {}
+    }
+
+    // --- Canvas fingerprinting (Brave-style noise) ---
+    // Replaces the blunt --disable-reading-from-canvas Chromium switch, which broke
+    // legitimate canvas use (image export, QR scanners, drawing apps, etc.).
+    //
+    // Technique: one bit is flipped in one RGBA channel of every canvas pixel readback.
+    // The channel index (_ch) is chosen once per V8 context — random per page load,
+    // stable within it — so the fingerprint hash is different every visit while the
+    // visible image is indistinguishable from the original.
+    //
+    // Covered surfaces:
+    //   1. CanvasRenderingContext2D.getImageData        — direct pixel readback
+    //   2. HTMLCanvasElement.toDataURL                  — most fingerprinting tests use this
+    //   3. HTMLCanvasElement.toBlob                     — async variant of toDataURL
+    //   4. WebGLRenderingContext.readPixels             — WebGL pixel readback
+    //   5. WebGL2RenderingContext.readPixels            — WebGL2 variant
+    (function () {
+        // RGBA channel to corrupt — random per page load, constant within the session.
+        const _ch = Math.floor(Math.random() * 4);
+
+        // Flip one bit in the chosen channel of a pixel buffer.
+        // Accepts Uint8Array (WebGL readPixels) or Uint8ClampedArray (ImageData.data).
+        function _flipBit(buf) {
+            if ((buf instanceof Uint8Array || buf instanceof Uint8ClampedArray) &&
+                buf.length >= 4)
+            {
+                buf[_ch] ^= 1;
+            }
+        }
+
+        // Render a canvas to a temporary copy with one flipped pixel so the original
+        // canvas is never modified.  Returns null if the copy cannot be made (e.g. the
+        // canvas is cross-origin tainted), in which case callers fall back to the real API.
+        function _noisedCopy(src) {
+            try {
+                const tmp = document.createElement('canvas');
+                tmp.width  = src.width;
+                tmp.height = src.height;
+                const ctx = tmp.getContext('2d');
+                if (!ctx) { return null; }
+                ctx.drawImage(src, 0, 0);
+                const px = ctx.getImageData(0, 0, 1, 1);
+                _flipBit(px.data);
+                ctx.putImageData(px, 0, 0);
+                return tmp;
+            } catch (_) { return null; }
+        }
+
+        // 1. getImageData
+        try {
+            const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = function () {
+                const d = _getImageData.apply(this, arguments);
+                _flipBit(d.data);
+                return d;
+            };
+        } catch (_) {}
+
+        // 2. toDataURL
+        try {
+            const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function (type, quality) {
+                if (this.width === 0 || this.height === 0) {
+                    return _toDataURL.call(this, type, quality);
+                }
+                const tmp = _noisedCopy(this);
+                return tmp ? _toDataURL.call(tmp, type, quality)
+                           : _toDataURL.call(this, type, quality);
+            };
+        } catch (_) {}
+
+        // 3. toBlob
+        try {
+            const _toBlob = HTMLCanvasElement.prototype.toBlob;
+            HTMLCanvasElement.prototype.toBlob = function (callback, type, quality) {
+                if (this.width === 0 || this.height === 0) {
+                    return _toBlob.call(this, callback, type, quality);
+                }
+                const tmp = _noisedCopy(this);
+                if (tmp) { _toBlob.call(tmp, callback, type, quality); }
+                else     { _toBlob.call(this, callback, type, quality); }
+            };
+        } catch (_) {}
+
+        // 4. WebGLRenderingContext.readPixels
+        // pixels buffer is always args[6]; the offset variant (WebGL2) passes a number
+        // there instead — _flipBit's instanceof check safely ignores that case.
+        try {
+            const _rp1 = WebGLRenderingContext.prototype.readPixels;
+            WebGLRenderingContext.prototype.readPixels = function () {
+                _rp1.apply(this, arguments);
+                _flipBit(arguments[6]);
+            };
+        } catch (_) {}
+
+        // 5. WebGL2RenderingContext.readPixels
+        try {
+            const _rp2 = WebGL2RenderingContext.prototype.readPixels;
+            WebGL2RenderingContext.prototype.readPixels = function () {
+                _rp2.apply(this, arguments);
+                _flipBit(arguments[6]);
+            };
+        } catch (_) {}
+    })();
+
+    // --- Timing precision ---
+    // Reduce performance.now() granularity to 0.1 ms to limit timing-based
+    // side-channel attacks (Spectre mitigations already do this in some
+    // configurations; we make it explicit and consistent).
+    if (typeof Performance !== 'undefined') {
+        try {
+            const _now = Performance.prototype.now;
+            Performance.prototype.now = function () {
+                return Math.round(_now.call(this) * 10) / 10;
+            };
+        } catch (_) {}
+    }
+
+    // --- Geolocation API ---
+    // Replace navigator.geolocation with a stub that always returns Linden Lab
+    // HQ (945 Battery St, San Francisco, CA 94111) instead of the real device
+    // location.  Using the prototype so the override applies to every frame.
+    (function () {
+        const _llCoords = {
+            latitude:         37.7988,
+            longitude:       -122.3984,
+            accuracy:         100,
+            altitude:         null,
+            altitudeAccuracy: null,
+            heading:          null,
+            speed:            null
+        };
+        const _fakeGeo = {
+            getCurrentPosition: function (success, _error, _opts) {
+                setTimeout(function () {
+                    success({ coords: _llCoords, timestamp: Date.now() });
+                }, 0);
+            },
+            watchPosition: function (success, _error, _opts) {
+                setTimeout(function () {
+                    success({ coords: _llCoords, timestamp: Date.now() });
+                }, 0);
+                return 0;
+            },
+            clearWatch: function (_id) {}
+        };
+        tryLock(Navigator.prototype, 'geolocation', _fakeGeo);
+    })();
+
+    // --- Timezone ---
+    // Lock the reported timezone to America/Los_Angeles so it is consistent
+    // with the geolocation anchor above.
+    //
+    // Two surfaces are covered:
+    //   1. Intl.DateTimeFormat().resolvedOptions().timeZone  — the string identifier
+    //      used by FingerprintJS and most modern fingerprinters.
+    //   2. Date.prototype.getTimezoneOffset()               — the numeric UTC offset
+    //      (PST = 480 min, i.e. UTC-8).  A fixed value is used; the small DST
+    //      inaccuracy in summer is an acceptable trade-off for privacy.
+    (function () {
+        const _fakeZone   = 'America/Los_Angeles';
+        const _fakeTZOff  = 480; // UTC-8 (PST)
+
+        // Capture the real system timezone once so we can replace it selectively:
+        // only swap when the formatter would have reported the real local zone.
+        // Formatters created with an explicit timeZone option are left untouched.
+        let _realZone = '';
+        try { _realZone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) {}
+
+        if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
+            try {
+                const _resolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+                Intl.DateTimeFormat.prototype.resolvedOptions = function () {
+                    const opts = _resolvedOptions.call(this);
+                    if (opts.timeZone === _realZone) {
+                        opts.timeZone = _fakeZone;
+                    }
+                    return opts;
+                };
+            } catch (_) {}
+        }
+
+        try {
+            Date.prototype.getTimezoneOffset = function () { return _fakeTZOff; };
+        } catch (_) {}
+    })();
+
+    // --- Font metric fingerprinting ---
+    // CSS-based font detectors (FingerprintJS, BrowserLeaks, amiunique…) work by
+    // rendering text in a hidden element and reading offsetWidth / getBoundingClientRect
+    // to detect whether the OS has a given font installed.  No canvas is involved, so
+    // --disable-reading-from-canvas gives no protection here.
+    //
+    // Technique (same as Font Fingerprint Defender and Brave's font protection):
+    //   Inject ±1e-6 px of random noise into every float measurement returned by
+    //   the four layout APIs fingerprinters rely on.  The noise is:
+    //     • Imperceptible — 0.000001 px is far below a physical pixel.
+    //     • Per-call random — each measurement call gets independent noise, so
+    //       the accumulated hash changes on every page load.
+    //     • Injected before any page script — CefRegisterExtension fires earlier
+    //       than a browser-extension content script, so there is no race window.
+    //
+    // Covered surfaces:
+    //   1. Element.prototype.getBoundingClientRect   — primary CSS metric path
+    //   2. Range.prototype.getBoundingClientRect     — text-node metric path
+    //   3. Element.prototype.getClientRects          — multi-rect variant
+    //   4. CanvasRenderingContext2D.prototype.measureText — canvas text metrics
+    //   5. document.fonts.check()                   — direct FontFaceSet probe
+    (function () {
+        const _noise = function () { return (Math.random() * 0.000002) - 0.000001; };
+
+        function _noisedRect(r) {
+            const n = _noise();
+            return new DOMRect(r.x + n, r.y + n, r.width + n, r.height + n);
+        }
+
+        // 1. Element.getBoundingClientRect
+        try {
+            const _eBCR = Element.prototype.getBoundingClientRect;
+            Element.prototype.getBoundingClientRect = function () {
+                return _noisedRect(_eBCR.call(this));
+            };
+        } catch (_) {}
+
+        // 2. Range.getBoundingClientRect
+        try {
+            const _rBCR = Range.prototype.getBoundingClientRect;
+            Range.prototype.getBoundingClientRect = function () {
+                return _noisedRect(_rBCR.call(this));
+            };
+        } catch (_) {}
+
+        // 3. Element.getClientRects
+        // Returns a DOMRectList; we return a noised array with a compatible .item() method.
+        try {
+            const _gCR = Element.prototype.getClientRects;
+            Element.prototype.getClientRects = function () {
+                const out = Array.from(_gCR.call(this), _noisedRect);
+                out.item = function (i) { return out[i] || null; };
+                return out;
+            };
+        } catch (_) {}
+
+        // 4. CanvasRenderingContext2D.measureText
+        // TextMetrics is not directly constructable, so we return a plain object.
+        // Each numeric property gets independent noise so all metrics are affected.
+        // Undefined properties (older Chromium) are passed through as-is via _addNoise.
+        try {
+            const _measureText = CanvasRenderingContext2D.prototype.measureText;
+            const _addNoise = function (v) { return typeof v === 'number' ? v + _noise() : v; };
+            CanvasRenderingContext2D.prototype.measureText = function (text) {
+                const m = _measureText.call(this, text);
+                return {
+                    width:                    _addNoise(m.width),
+                    actualBoundingBoxLeft:    _addNoise(m.actualBoundingBoxLeft),
+                    actualBoundingBoxRight:   _addNoise(m.actualBoundingBoxRight),
+                    fontBoundingBoxAscent:    _addNoise(m.fontBoundingBoxAscent),
+                    fontBoundingBoxDescent:   _addNoise(m.fontBoundingBoxDescent),
+                    actualBoundingBoxAscent:  _addNoise(m.actualBoundingBoxAscent),
+                    actualBoundingBoxDescent: _addNoise(m.actualBoundingBoxDescent),
+                    emHeightAscent:           _addNoise(m.emHeightAscent),
+                    emHeightDescent:          _addNoise(m.emHeightDescent),
+                    hangingBaseline:          _addNoise(m.hangingBaseline),
+                    alphabeticBaseline:       _addNoise(m.alphabeticBaseline),
+                    ideographicBaseline:      _addNoise(m.ideographicBaseline)
+                };
+            };
+        } catch (_) {}
+
+        // 5. document.fonts.check() — direct FontFaceSet enumeration
+        // Returns false for every font so the API reveals nothing about the installed set.
+        try {
+            if (typeof document !== 'undefined' && document.fonts) {
+                document.fonts.check = function () { return false; };
+            }
+        } catch (_) {}
+    })();
+})();
+)js";
+
+class dullahan_privacy_app :
+    public CefApp,
+    public CefRenderProcessHandler
+{
+public:
+    // CefApp override - return ourselves as the render process handler.
+    CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override
+    {
+        return this;
+    }
+
+    // CefRenderProcessHandler override.
+    // Called once in the render process after WebKit has been initialised but
+    // before any frame contexts are created.  This is the correct place to
+    // register V8 extensions: the extension code is then injected into every
+    // subsequent V8 context before any page script runs.
+    void OnWebKitInitialized() override
+    {
+        CefRefPtr<CefCommandLine> cmdLine = CefCommandLine::GetGlobalCommandLine();
+        if (!cmdLine->HasSwitch("dullahan-protect-privacy"))
+        {
+            return;
+        }
+
+        // nullptr handler is fine for pure-JS extensions (no 'native function' declarations).
+        CefRegisterExtension("dullahan/privacy", kPrivacyShimJS, nullptr);
+    }
+
+    IMPLEMENT_REFCOUNTING(dullahan_privacy_app);
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Platform entry points
+///////////////////////////////////////////////////////////////////////////////
 
 #ifdef __linux__
 #if defined(NO_STACK_PROTECTOR)
@@ -35,9 +426,11 @@ NO_STACK_PROTECTOR
 int main(int argc, char* argv[])
 {
     CefMainArgs main_args(argc, argv);
-    return CefExecuteProcess(main_args, nullptr, nullptr);
+    CefRefPtr<dullahan_privacy_app> app(new dullahan_privacy_app);
+    return CefExecuteProcess(main_args, app, nullptr);
 }
 #endif
+
 #ifdef WIN32
 #include <windows.h>
 
@@ -151,7 +544,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     enablePPAPIFlashHack(lpCmdLine);
 
-    return CefExecuteProcess(args, nullptr, nullptr);
+    CefRefPtr<dullahan_privacy_app> app(new dullahan_privacy_app);
+    return CefExecuteProcess(args, app, nullptr);
 }
 #endif
 
@@ -174,7 +568,9 @@ int main(int argc, char* argv[])
     // Provide CEF with command-line arguments.
     CefMainArgs args(argc, argv);
 
+    CefRefPtr<dullahan_privacy_app> app(new dullahan_privacy_app);
+
     // Execute the sub-process.
-    return CefExecuteProcess(args, nullptr, nullptr);
+    return CefExecuteProcess(args, app, nullptr);
 }
 #endif

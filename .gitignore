@@ -6,3 +6,4 @@ stage
 *.tar.bz2
 .DS_Store
 *.orig
+.claude/settings.local.json

@@ -134,6 +134,7 @@ class dullahan_impl :
 
         bool getFlipPixelsY();
         bool getFlipMouseY();
+        bool getProtectPrivacy() const { return mProtectPrivacy; }
 
         void requestPageZoom();
 
@@ -180,6 +181,7 @@ class dullahan_impl :
         bool mFakeUIForMediaStream;
         bool mFlipPixelsY;
         bool mFlipMouseY;
+        bool mProtectPrivacy;
         double mRequestedPageZoom;
         const int mViewDepth = 4;
         std::vector<std::string> mCustomSchemes;

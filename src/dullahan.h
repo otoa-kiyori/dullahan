@@ -169,6 +169,7 @@ class dullahan
             bool media_stream_enabled = false;          // web cams etc. (caution)
             bool plugins_enabled = true;                // all plugins
             bool webgl_enabled = true;                  // webgl
+            bool protect_privacy = false;               // block canvas readback, WebGL GPU info, UA Client Hints, screen size leak
 
             // explicitly set the path to the locales folder since defaults no longer work on some systems
             std::string locales_dir_path = std::string();
