@@ -445,6 +445,82 @@ if (BUILD_EXAMPLES)
     elseif(IS_MACOS)
         add_dependencies(opengl-example dullahan_host dullahan_host_alerts dullahan_host_gpu dullahan_host_renderer dullahan_host_plugin)
     endif()
+
+    ###############################################################################
+    # Privacy test application
+
+    add_executable(
+        privacy-test
+        MACOSX_BUNDLE
+        examples/privacy-test/src/privacy_test_app.cpp
+        examples/privacy-test/src/privacy_test_app.h
+        ${THIRD-PARTY-PREFIX}/${GLAD_FOLDER}/src/glad.c
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}/imgui.cpp
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}/imgui_draw.cpp
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}/imgui_impl_glfw.cpp
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}/imgui_impl_opengl2.cpp
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}/imgui_tables.cpp
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}/imgui_widgets.cpp
+    )
+
+    target_include_directories(
+        privacy-test
+        PUBLIC
+        src
+        ${THIRD-PARTY-PREFIX}/${GLAD_FOLDER}/include
+        ${THIRD-PARTY-PREFIX}/${GLFW_FOLDER}/include
+        ${THIRD-PARTY-PREFIX}/${IMGUI_FOLDER}
+    )
+
+    if(IS_WINDOWS)
+        target_link_libraries(
+            privacy-test
+            dullahan
+            opengl32
+            comctl32
+            ${CEF_LIBRARY}
+            ${CEF_DLL_LIBRARY}
+            ${THIRD-PARTY-PREFIX}/${GLFW_FOLDER}/${GLFW_LIB_PATH}
+        )
+    elseif(IS_MACOS)
+        target_link_libraries(
+            privacy-test
+            dullahan
+            ${CEF_DLL_LIBRARY}
+            ${THIRD-PARTY-PREFIX}/${GLFW_FOLDER}/${GLFW_LIB_PATH}
+            ${OPENGL_FRAMEWORK}
+            ${COCOA_FRAMEWORK}
+            ${IO_FRAMEWORK}
+        )
+        set(PRIVACY_TEST_FRAMEWORKS
+            "${CEF_WRAPPER_DIR}/Release/Chromium Embedded Framework.framework"
+            dullahan_host
+            dullahan_host_alerts
+            dullahan_host_gpu
+            dullahan_host_renderer
+            dullahan_host_plugin
+        )
+        set_target_properties(privacy-test
+                            PROPERTIES
+                            XCODE_EMBED_FRAMEWORKS "${PRIVACY_TEST_FRAMEWORKS}")
+    endif()
+
+    add_dependencies(privacy-test dullahan)
+    if(IS_WINDOWS)
+        add_dependencies(privacy-test dullahan_host)
+    elseif(IS_MACOS)
+        add_dependencies(privacy-test dullahan_host dullahan_host_alerts dullahan_host_gpu dullahan_host_renderer dullahan_host_plugin)
+    endif()
+
+    # Copy HTML test page to the build output directory so the app can load it
+    add_custom_command(
+        TARGET privacy-test POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy
+                "${CMAKE_SOURCE_DIR}/examples/privacy-test/privacy_test.html"
+                "$<TARGET_FILE_DIR:privacy-test>/privacy_test.html"
+        COMMENT "Copying privacy_test.html to build directory"
+    )
+
 endif()
 
 if(CMAKE_CONFIGURATION_TYPES)
